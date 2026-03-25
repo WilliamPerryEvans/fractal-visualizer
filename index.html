@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Fractal Visualizer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
+
+    canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+    /* ── Top bar ── */
+    #ui-top {
+      position: fixed; top: 0; left: 0; right: 0;
+      padding: 12px 14px;
+      background: linear-gradient(to bottom, rgba(0,0,0,.75) 0%, transparent 100%);
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    }
+    #fractal-name {
+      color: #fff; font-size: 14px; font-weight: bold;
+      letter-spacing: .1em; text-transform: uppercase;
+      margin-right: 4px; white-space: nowrap;
+    }
+    #frac-btns { display: flex; gap: 5px; flex-wrap: wrap; }
+    .fb {
+      background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.25);
+      color: rgba(255,255,255,.7); padding: 4px 10px; border-radius: 20px;
+      cursor: pointer; font-family: inherit; font-size: 12px; letter-spacing: .03em;
+      transition: background .15s, color .15s; white-space: nowrap; user-select: none;
+    }
+    .fb:hover { background: rgba(255,255,255,.22); color: #fff; }
+    .fb.on  { background: rgba(255,255,255,.28); border-color: rgba(255,255,255,.7); color: #fff; }
+    #ui-right { margin-left: auto; display: flex; gap: 5px; }
+    .ab {
+      background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.2);
+      color: rgba(255,255,255,.65); padding: 4px 12px; border-radius: 20px;
+      cursor: pointer; font-family: inherit; font-size: 12px;
+      transition: background .15s, color .15s; user-select: none;
+    }
+    .ab:hover { background: rgba(255,255,255,.2); color: #fff; }
+    .ab.on  { background: rgba(80,180,255,.2); border-color: rgba(80,180,255,.6); color: #7df; }
+
+    /* ── Bottom hint ── */
+    #hint {
+      position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%);
+      color: rgba(255,255,255,.3); font-size: 11px; letter-spacing: .05em;
+      pointer-events: none; white-space: nowrap;
+    }
+
+    @media (max-width: 580px) {
+      #fractal-name { display: none; }
+      .fb { padding: 5px 8px; }
+      #hint { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+
+<div id="ui-top">
+  <span id="fractal-name">Mandelbrot Set</span>
+  <div id="frac-btns"></div>
+  <div id="ui-right">
+    <button class="ab" id="anim-btn" onclick="toggleAnim()">▶ Animate</button>
+    <button class="ab" onclick="resetView()">↺ Reset</button>
+  </div>
+</div>
+
+<div id="hint">Scroll · zoom &nbsp;|&nbsp; Drag · pan &nbsp;|&nbsp; 1–5 · switch &nbsp;|&nbsp; A · animate</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+//  Shaders
+// ═══════════════════════════════════════════════════════════
+
+const VERT = `#version 300 es
+layout(location=0) in vec2 p;
+void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
+
+const GEO_VERT = `#version 300 es
+precision highp float;
+layout(location=0) in vec2 p;
+uniform vec2 u_res, u_center;
+uniform float u_zoom;
+void main() {
+  float asp = u_res.x / u_res.y;
+  gl_Position = vec4(
+    (p.x - u_center.x) / (u_zoom * .5 * asp),
+    (p.y - u_center.y) / (u_zoom * .5),
+    0.0, 1.0);
+}`;
+
+const GEO_FRAG = `#version 300 es
+precision highp float;
+uniform vec3 u_color;
+out vec4 o; void main() { o = vec4(u_color, 1.0); }`;
+
+const FADE_FRAG = `#version 300 es
+precision highp float;
+uniform float u_alpha;
+out vec4 o; void main() { o = vec4(0.0, 0.0, 0.0, u_alpha); }`;
+
+// Smooth-colouring helper shared by escape-time shaders
+const PALETTE_FN = `
+vec3 pal(float t) {
+  vec3 a=vec3(.5,.5,.5), b=vec3(.5,.5,.5), c=vec3(1,1,1);
+  vec3 d=vec3(D);
+  return a + b*cos(6.28318*(c*t+d));
+}`;
+
+function escapeFrag(dVec, extra='', preIter='') {
+  return `#version 300 es
+precision highp float;
+uniform vec2 u_res, u_center;
+uniform float u_zoom;
+uniform int u_max_iter;
+out vec4 fragColor;
+${PALETTE_FN.replace('D', dVec)}
+void main() {
+  vec2 uv = (gl_FragCoord.xy - u_res*.5) / u_res.y;
+  ${extra}
+  vec2 z = vec2(0.0);
+  int iter = 0;
+  for (int i = 0; i < 1024; i++) {
+    if (i >= u_max_iter) break;
+    ${preIter}
+    z = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
+    if (dot(z,z) > 4.0) break;
+    iter++;
+  }
+  if (iter == u_max_iter) { fragColor = vec4(0,0,0,1); return; }
+  float s = float(iter) - log2(log2(dot(z,z))) + 4.0;
+  fragColor = vec4(pal(s / float(u_max_iter)), 1.0);
+}`;
+}
+
+const MANDELBROT_FRAG = escapeFrag(
+  '.263,.416,.557',
+  'vec2 c = u_center + uv * u_zoom;'
+);
+
+const JULIA_FRAG = escapeFrag(
+  '0.0,.33,.67',
+  `vec2 c = vec2(-0.7269, 0.1889);
+   vec2 z = u_center + uv * u_zoom;`,  // z starts at pixel; only label differs
+  ''
+).replace(
+  'vec2 z = vec2(0.0);',   // Julia: z = pixel, not 0
+  '// z already set above'
+).replace(
+  'z = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;',
+  'z = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;'
+);
+
+// Julia: hand-write to avoid the substitution mess
+const JULIA_FRAG2 = `#version 300 es
+precision highp float;
+uniform vec2 u_res, u_center;
+uniform float u_zoom;
+uniform int u_max_iter;
+out vec4 fragColor;
+vec3 pal(float t) {
+  vec3 a=vec3(.5,.5,.5),b=vec3(.5,.5,.5),c2=vec3(1,1,1),d=vec3(0.,.33,.67);
+  return a+b*cos(6.28318*(c2*t+d));
+}
+void main() {
+  vec2 uv = (gl_FragCoord.xy - u_res*.5) / u_res.y;
+  vec2 z = u_center + uv * u_zoom;
+  vec2 c = vec2(-0.7269, 0.1889);
+  int iter = 0;
+  for (int i = 0; i < 1024; i++) {
+    if (i >= u_max_iter) break;
+    z = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
+    if (dot(z,z) > 4.0) break;
+    iter++;
+  }
+  if (iter == u_max_iter) { fragColor = vec4(0,0,0,1); return; }
+  float s = float(iter) - log2(log2(dot(z,z))) + 4.0;
+  fragColor = vec4(pal(s / float(u_max_iter)), 1.0);
+}`;
+
+const BURNING_SHIP_FRAG = `#version 300 es
+precision highp float;
+uniform vec2 u_res, u_center;
+uniform float u_zoom;
+uniform int u_max_iter;
+out vec4 fragColor;
+vec3 pal(float t) {
+  vec3 a=vec3(.5,.2,.1),b=vec3(.5,.3,.2),c=vec3(1,1,.5),d=vec3(0.,.1,.3);
+  return a+b*cos(6.28318*(c*t+d));
+}
+void main() {
+  vec2 uv = (gl_FragCoord.xy - u_res*.5) / u_res.y;
+  vec2 c = u_center + vec2(uv.x, -uv.y) * u_zoom;
+  vec2 z = vec2(0.0);
+  int iter = 0;
+  for (int i = 0; i < 1024; i++) {
+    if (i >= u_max_iter) break;
+    z = vec2(abs(z.x), abs(z.y));
+    z = vec2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
+    if (dot(z,z) > 4.0) break;
+    iter++;
+  }
+  if (iter == u_max_iter) { fragColor = vec4(0,0,0,1); return; }
+  float s = float(iter) - log2(log2(dot(z,z))) + 4.0;
+  fragColor = vec4(pal(s / float(u_max_iter)), 1.0);
+}`;
+
+const SIERPINSKI_FRAG = `#version 300 es
+precision highp float;
+uniform vec2 u_res, u_center;
+uniform float u_zoom;
+uniform int u_max_iter;
+out vec4 fragColor;
+const float S3 = 1.7320508;
+float es(vec2 p,vec2 a,vec2 b){ return (b.x-a.x)*(p.y-a.y)-(b.y-a.y)*(p.x-a.x); }
+bool inTri(vec2 p,vec2 a,vec2 b,vec2 c){
+  float d1=es(p,a,b),d2=es(p,b,c),d3=es(p,c,a);
+  return !((d1<0.||d2<0.||d3<0.)&&(d1>0.||d2>0.||d3>0.));
+}
+vec3 pal(float t){
+  vec3 a=vec3(.1,.4,.3),b=vec3(.4,.4,.3),c=vec3(1.,.8,.5),d=vec3(0.,.25,.55);
+  return a+b*cos(6.28318*(c*t+d));
+}
+void main() {
+  vec2 uv = (gl_FragCoord.xy - u_res*.5) / u_res.y;
+  vec2 p = u_center + uv * u_zoom;
+  vec2 v0=vec2(0.,1.), v1=vec2(-S3/2.,-.5), v2=vec2(S3/2.,-.5);
+  if (!inTri(p,v0,v1,v2)) { fragColor=vec4(.05,.05,.08,1); return; }
+  for (int i=0; i<64; i++) {
+    if (i >= u_max_iter) break;
+    vec2 m01=(v0+v1)*.5, m02=(v0+v2)*.5, m12=(v1+v2)*.5;
+    if (inTri(p,m01,m12,m02)) { fragColor=vec4(pal(float(i)/float(u_max_iter)),1); return; }
+    if      (inTri(p,v0,m01,m02)) { v1=m01; v2=m02; }
+    else if (inTri(p,m01,v1,m12)) { v0=m01; v2=m12; }
+    else                           { v0=m02; v1=m12; }
+  }
+  fragColor = vec4(0,.02,.05,1);
+}`;
+
+// ═══════════════════════════════════════════════════════════
+//  Fractal registry
+// ═══════════════════════════════════════════════════════════
+
+const FRACTALS = [
+  { name:'Mandelbrot Set',      type:'shader', frag:MANDELBROT_FRAG,   center:[-0.5,0],   zoom:3.0 },
+  { name:'Julia Set',           type:'shader', frag:JULIA_FRAG2,       center:[0,0],      zoom:3.0 },
+  { name:'Burning Ship',        type:'shader', frag:BURNING_SHIP_FRAG, center:[-0.5,0.5], zoom:3.5 },
+  { name:'Koch Snowflake',      type:'geom',                           center:[0,0],      zoom:3.2, color:[0.2,0.7,1.0] },
+  { name:'Sierpinski Triangle', type:'shader', frag:SIERPINSKI_FRAG,   center:[0,0],      zoom:3.0 },
+];
+
+const ANIM_SEQ = [
+  { fi:0, target:[-0.74878, 0.06508], endZoom:3e-6 },
+  { fi:4, target:[ 0.0,     1.0    ], endZoom:5e-7 },
+  { fi:1, target:[ 0.0,     0.0    ], endZoom:2e-5 },
+  { fi:0, target:[-0.1592, -1.0317 ], endZoom:5e-6 },
+  { fi:2, target:[-0.5,     0.5    ], endZoom:8e-4 },
+  { fi:4, target:[-0.43301, 0.25   ], endZoom:5e-7 },
+  { fi:1, target:[ 0.5,     0.0    ], endZoom:5e-5 },
+  { fi:0, target:[ 0.3023,  0.01885], endZoom:3e-6 },
+];
+
+const ZOOM_SPEED = 0.22, CENTER_LERP = 1.0, FADE_SPEED = 1.2;
+
+// ═══════════════════════════════════════════════════════════
+//  WebGL helpers
+// ═══════════════════════════════════════════════════════════
+
+let gl, canvas;
+let programs = [];   // indexed by fractal index (null for geom)
+let geoProg, geoU;
+let fadeProg, fadeU, fadeVAO;
+let quadVAO, kochVAO, kochCount;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    console.error(gl.getShaderInfoLog(s), src.slice(0,300));
+  return s;
+}
+
+function mkProg(vSrc, fSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    console.error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+function uniforms(prog) {
+  const n = gl.getProgramParameter(prog, gl.ACTIVE_UNIFORMS), m = {};
+  for (let i=0; i<n; i++) {
+    const info = gl.getActiveUniform(prog, i);
+    m[info.name] = gl.getUniformLocation(prog, info.name);
+  }
+  return m;
+}
+
+function mkVAO(verts) {
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return vao;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Koch snowflake
+// ═══════════════════════════════════════════════════════════
+
+function kochVerts(depth=5) {
+  const S3 = Math.sqrt(3);
+  function* sub(p1, p2, d) {
+    if (d===0) { yield p1; return; }
+    const dx=(p2[0]-p1[0])/3, dy=(p2[1]-p1[1])/3;
+    const q=[p1[0]+dx, p1[1]+dy], s=[p1[0]+2*dx, p1[1]+2*dy];
+    const r=[q[0]+dx*.5+dy*S3/2, q[1]-dx*S3/2+dy*.5];
+    yield* sub(p1,q,d-1); yield* sub(q,r,d-1);
+    yield* sub(r,s,d-1);  yield* sub(s,p2,d-1);
+  }
+  const p1=[-S3/2,-.5], p2=[S3/2,-.5], p3=[0,1];
+  const pts=[...sub(p1,p2,depth),...sub(p2,p3,depth),...sub(p3,p1,depth)];
+  return new Float32Array(pts.flat());
+}
+
+// ═══════════════════════════════════════════════════════════
+//  State
+// ═══════════════════════════════════════════════════════════
+
+let fi=0, center=[-0.5,0], zoom=3, maxIter=128;
+let animating=false, animIdx=0, animState='zooming';
+let fadeAlpha=0, animTarget=[0,0], animEndZoom=1e-6;
+let dragging=false, lx=0, ly=0, ltDist=0, lastT=null;
+
+// ═══════════════════════════════════════════════════════════
+//  Init
+// ═══════════════════════════════════════════════════════════
+
+function init() {
+  canvas = document.getElementById('c');
+  gl = canvas.getContext('webgl2');
+  if (!gl) {
+    document.body.innerHTML = `<div style="color:#fff;font-family:monospace;
+      text-align:center;padding:60px;font-size:15px">
+      Your browser does not support WebGL 2.<br><br>
+      Try Chrome, Firefox, or Edge.</div>`;
+    return;
+  }
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  // Shared fullscreen quad VAO (all shaders use layout(location=0))
+  quadVAO = mkVAO(new Float32Array([-1,-1, 1,-1, -1,1, 1,-1, 1,1, -1,1]));
+
+  // Shader fractals
+  for (let i=0; i<FRACTALS.length; i++) {
+    const f = FRACTALS[i];
+    if (f.type === 'shader') {
+      const prog = mkProg(VERT, f.frag);
+      programs[i] = { prog, u: uniforms(prog) };
+    } else {
+      programs[i] = null;
+    }
+  }
+
+  // Geometry (Koch)
+  geoProg = mkProg(GEO_VERT, GEO_FRAG);
+  geoU = uniforms(geoProg);
+  const kv = kochVerts(5);
+  kochVAO = mkVAO(kv);
+  kochCount = kv.length / 2;
+
+  // Fade overlay
+  fadeProg = mkProg(VERT, FADE_FRAG);
+  fadeU = uniforms(fadeProg);
+  fadeVAO = quadVAO;  // reuse quad
+
+  // Build fractal buttons
+  const container = document.getElementById('frac-btns');
+  FRACTALS.forEach((f,i) => {
+    const b = document.createElement('button');
+    b.className = 'fb' + (i===0 ? ' on' : '');
+    b.id = 'fb'+i;
+    b.textContent = `${i+1} ${f.name}`;
+    b.onclick = () => { switchTo(i); if(animating) stopAnim(); };
+    container.appendChild(b);
+  });
+
+  resize();
+  window.addEventListener('resize', resize);
+  canvas.addEventListener('wheel', onWheel, {passive:false});
+  canvas.addEventListener('mousedown',  e => { if(!animating){dragging=true; lx=e.clientX; ly=e.clientY;} });
+  canvas.addEventListener('mousemove',  onMouseMove);
+  canvas.addEventListener('mouseup',    () => dragging=false);
+  canvas.addEventListener('mouseleave', () => dragging=false);
+  canvas.addEventListener('touchstart', onTouchStart, {passive:false});
+  canvas.addEventListener('touchmove',  onTouchMove,  {passive:false});
+  canvas.addEventListener('touchend',   () => { dragging=false; ltDist=0; });
+  window.addEventListener('keydown', onKey);
+
+  requestAnimationFrame(frame);
+}
+
+function resize() {
+  const dpr = devicePixelRatio || 1;
+  canvas.width  = Math.floor(canvas.clientWidth  * dpr);
+  canvas.height = Math.floor(canvas.clientHeight * dpr);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Switching & animation
+// ═══════════════════════════════════════════════════════════
+
+function switchTo(idx) {
+  fi = idx;
+  const f = FRACTALS[idx];
+  center = [...f.center]; zoom = f.zoom; maxIter = 128;
+  document.getElementById('fractal-name').textContent = f.name;
+  document.querySelectorAll('.fb').forEach((b,i) => b.classList.toggle('on', i===idx));
+}
+
+function startStep(idx) {
+  animIdx = idx % ANIM_SEQ.length;
+  const s = ANIM_SEQ[animIdx];
+  switchTo(s.fi);
+  zoom       = FRACTALS[s.fi].zoom;
+  center     = [...FRACTALS[s.fi].center];
+  animTarget = [...s.target];
+  animEndZoom = s.endZoom;
+  animState  = 'zooming';
+  fadeAlpha  = 0;
+}
+
+function toggleAnim() {
+  animating ? stopAnim() : startAnim();
+}
+
+function startAnim() {
+  animating = true;
+  document.getElementById('anim-btn').textContent = '⏸ Stop';
+  document.getElementById('anim-btn').classList.add('on');
+  startStep(animIdx);
+}
+
+function stopAnim() {
+  animating = false;
+  fadeAlpha = 0;
+  document.getElementById('anim-btn').textContent = '▶ Animate';
+  document.getElementById('anim-btn').classList.remove('on');
+}
+
+function resetView() {
+  stopAnim();
+  switchTo(fi);
+}
+
+function tickAnim(dt) {
+  if (animState === 'zooming') {
+    zoom *= Math.exp(-ZOOM_SPEED * dt);
+    const t = 1 - Math.exp(-CENTER_LERP * dt);
+    center[0] += (animTarget[0] - center[0]) * t;
+    center[1] += (animTarget[1] - center[1]) * t;
+    maxIter = Math.min(2048, Math.max(128, Math.floor(120 * Math.log2(Math.max(3/zoom, 2)))));
+    if (zoom <= animEndZoom) animState = 'fade_out';
+
+  } else if (animState === 'fade_out') {
+    fadeAlpha = Math.min(1, fadeAlpha + FADE_SPEED * dt);
+    if (fadeAlpha >= 1) { startStep(animIdx+1); animState = 'fade_in'; }
+
+  } else if (animState === 'fade_in') {
+    fadeAlpha = Math.max(0, fadeAlpha - FADE_SPEED * dt);
+    if (fadeAlpha <= 0) animState = 'zooming';
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Render
+// ═══════════════════════════════════════════════════════════
+
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const dt = lastT === null ? 0 : Math.min((ts - lastT) / 1000, 0.1);
+  lastT = ts;
+
+  if (animating) tickAnim(dt);
+
+  gl.clearColor(.05,.05,.08,1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  const W = canvas.width, H = canvas.height;
+  const f = FRACTALS[fi];
+
+  if (f.type === 'shader') {
+    const {prog, u} = programs[fi];
+    gl.useProgram(prog);
+    gl.uniform2f(u.u_res, W, H);
+    gl.uniform2f(u.u_center, center[0], center[1]);
+    gl.uniform1f(u.u_zoom, zoom);
+    gl.uniform1i(u.u_max_iter, maxIter);
+    gl.bindVertexArray(quadVAO);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  } else {
+    gl.useProgram(geoProg);
+    gl.uniform2f(geoU.u_res, W, H);
+    gl.uniform2f(geoU.u_center, center[0], center[1]);
+    gl.uniform1f(geoU.u_zoom, zoom);
+    gl.uniform3fv(geoU.u_color, f.color);
+    gl.bindVertexArray(kochVAO);
+    gl.drawArrays(gl.LINE_LOOP, 0, kochCount);
+  }
+  gl.bindVertexArray(null);
+
+  if (fadeAlpha > 0.001) {
+    gl.useProgram(fadeProg);
+    gl.uniform1f(fadeU.u_alpha, fadeAlpha);
+    gl.bindVertexArray(fadeVAO);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.bindVertexArray(null);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Input
+// ═══════════════════════════════════════════════════════════
+
+function onWheel(e) {
+  e.preventDefault();
+  if (!animating) zoom *= e.deltaY > 0 ? 1.15 : 0.85;
+}
+
+function onMouseMove(e) {
+  if (!dragging || animating) return;
+  const dx = e.clientX-lx, dy = e.clientY-ly;
+  lx = e.clientX; ly = e.clientY;
+  const s = zoom / canvas.clientHeight;
+  center[0] -= dx*s; center[1] += dy*s;
+}
+
+function onTouchStart(e) {
+  e.preventDefault();
+  if (e.touches.length === 1) {
+    dragging=true; lx=e.touches[0].clientX; ly=e.touches[0].clientY;
+  } else if (e.touches.length === 2) {
+    dragging=false;
+    ltDist = Math.hypot(e.touches[0].clientX-e.touches[1].clientX,
+                        e.touches[0].clientY-e.touches[1].clientY);
+  }
+}
+
+function onTouchMove(e) {
+  e.preventDefault();
+  if (animating) return;
+  if (e.touches.length === 1 && dragging) {
+    const dx=e.touches[0].clientX-lx, dy=e.touches[0].clientY-ly;
+    lx=e.touches[0].clientX; ly=e.touches[0].clientY;
+    const s=zoom/canvas.clientHeight;
+    center[0]-=dx*s; center[1]+=dy*s;
+  } else if (e.touches.length === 2) {
+    const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,
+                       e.touches[0].clientY-e.touches[1].clientY);
+    if (ltDist>0) zoom *= ltDist/d;
+    ltDist=d;
+  }
+}
+
+function onKey(e) {
+  if (e.key>='1'&&e.key<='5') { switchTo(+e.key-1); stopAnim(); }
+  else if (e.key==='a'||e.key==='A') toggleAnim();
+  else if (e.key==='r'||e.key==='R') resetView();
+  else if (e.key==='ArrowUp')   maxIter=Math.min(maxIter+64,2048);
+  else if (e.key==='ArrowDown') maxIter=Math.max(maxIter-64,64);
+}
+
+window.addEventListener('load', init);
+</script>
+</body>
+</html>
